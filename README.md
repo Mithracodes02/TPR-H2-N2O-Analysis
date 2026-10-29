@@ -42,3 +42,4 @@ Self-test: `python tests_check.py` → about 18.3 m²/g for the sample file.
 - Only the Cu surface is oxidized to Cu2O (no bulk oxidation) at the N2O temperature.
 - No blank run is subtracted, so the slight smearing of the N2O step by the setup itself is not removed. Starting the integral at the N2 onset keeps this error small.
 - Cu surface density 1.47×10¹⁹ atoms/m² (can be changed in the sidebar).
+
