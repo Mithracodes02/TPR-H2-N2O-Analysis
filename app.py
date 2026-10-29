@@ -53,6 +53,17 @@ def fmt(x, f="{:.3g}"):
     return "–" if x is None or (isinstance(x, float) and not np.isfinite(x)) else f.format(x)
 
 
+def plot_raw(raw: pd.DataFrame, title="Raw signals – use this to pick the right columns"):
+    fig = go.Figure()
+    for c in raw.columns:
+        if c != "time":
+            fig.add_scatter(x=raw["time"], y=raw[c], name=str(c), line=dict(width=1.2))
+    fig.update_layout(title=title, height=380, template="plotly_white", yaxis_type="log",
+                      xaxis_title="Time (s)", yaxis_title="signal (log scale)", legend=dict(orientation="h"),
+                      margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+
 summary_rows = []
 tabs = st.tabs([f.name for f in files] + (["📋 Summary"] if len(files) > 1 else []))
 
@@ -73,7 +84,8 @@ for tab, up in zip(tabs, files):
             n2 = st.selectbox("N2 (m/z 28)", [None] + sig_cols,
                               index=([None] + sig_cols).index(guess["n2"]), key=f"n2_{key}")
         with c2:
-            n2o = st.selectbox("N2O (m/z 44)", sig_cols, index=sig_cols.index(guess["n2o"]), key=f"n2o_{key}")
+            n2o = st.selectbox("N2O (m/z 44)", sig_cols,
+                               index=sig_cols.index(guess["n2o"]) if guess["n2o"] in sig_cols else 0, key=f"n2o_{key}")
         with c3:
             ref = st.selectbox("Inert reference", [None] + sig_cols,
                                index=([None] + sig_cols).index(guess["ref"]), key=f"ref_{key}")
@@ -88,6 +100,10 @@ for tab, up in zip(tabs, files):
             basis = st.selectbox("Loading basis", na.LOADING_BASES,
                                  index=na.LOADING_BASES.index(d_basis), key=f"b_{key}")
 
+        if n2o in (n2, ref):
+            st.error("N2O must be a different column from N2 and the reference.")
+            plot_raw(raw)
+            continue
         cols = {"n2": n2, "n2o": n2o, "ref": ref}
         p = na.prepare(raw, cols, normalize=normalize and ref is not None)
         t = p["time"].to_numpy()
@@ -97,8 +113,10 @@ for tab, up in zip(tabs, files):
             auto = na.auto_windows(p, na.Windows(onset_threshold=thr, plateau_fraction=pl_frac,
                                                  plateau_length_s=pl_len))
         except Exception as e:  # noqa: BLE001
-            st.error(f"Automatic window detection failed: {e}")
-            continue
+            st.error(f"Automatic window detection failed: {e}. Check the column choice, or set the windows manually.")
+            plot_raw(raw)
+            auto = na.Windows((tmin, tmin + 0.15 * (tmax - tmin)), tmin + 0.2 * (tmax - tmin),
+                              (tmin + 0.5 * (tmax - tmin), tmax))
 
         # --- windows (auto + manual override)
         with st.expander("Time windows", expanded=False):
@@ -120,6 +138,7 @@ for tab, up in zip(tabs, files):
             res, calc = na.analyse(p, sample, win)
         except Exception as e:  # noqa: BLE001
             st.error(str(e))
+            plot_raw(raw)
             continue
 
         # --- results
@@ -138,6 +157,8 @@ for tab, up in zip(tabs, files):
         )
         for w_ in res.warnings:
             st.warning(w_)
+        with st.expander("Show raw signals"):
+            plot_raw(raw, "Raw signals (log scale)")
 
         # --- plots
         def shade(fig):
@@ -201,3 +222,4 @@ Onset = first point where N2 exceeds the threshold; plateau = first point where 
 chosen fraction of its final level. No blank run is subtracted.
 """
     )
+
