@@ -47,16 +47,59 @@ def read_pv_massspec_dat(data: bytes | str) -> pd.DataFrame:
     return df.sort_values("time").reset_index(drop=True)
 
 
+def _numeric_block(df: pd.DataFrame) -> pd.DataFrame | None:
+    """Find the main numeric table in a sheet read without header (time column + signal columns)."""
+    num = df.apply(pd.to_numeric, errors="coerce")
+    counts = num.notna().sum()
+    if counts.max() < 10:
+        return None
+    keep = [c for c in num.columns if counts[c] >= 0.8 * counts.max()]
+    if len(keep) < 2:
+        return None
+    block = num[keep].dropna()
+    if len(block) < 10:
+        return None
+    # header: last text row above the first numeric row
+    first = block.index[0]
+    names = []
+    for c in keep:
+        label = None
+        for r in range(first - 1, -1, -1):
+            v = df.at[r, c] if r in df.index else None
+            if isinstance(v, str) and v.strip():
+                label = v.strip().replace("\n", " ")
+                break
+        names.append(label or f"col_{c}")
+    seen = {}
+    for i, n in enumerate(names):  # make unique
+        if n in seen:
+            seen[n] += 1
+            names[i] = f"{n} ({seen[n]})"
+        else:
+            seen[n] = 0
+    block.columns = names
+    block = block.rename(columns={names[0]: "time"})
+    # keep only rows with increasing time (drops stray trailing blocks)
+    block = block[block["time"].diff().fillna(1) > 0]
+    return block.reset_index(drop=True)
+
+
 def read_table(data: bytes, filename: str) -> pd.DataFrame:
-    """CSV / TXT / XLSX with a header row. First column = time (s)."""
+    """CSV / TXT / XLSX. First numeric column = time (s), following columns = signals.
+    For workbooks, the sheet with the largest numeric table is used."""
     name = filename.lower()
-    if name.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(io.BytesIO(data))
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None)
     else:
-        df = pd.read_csv(io.BytesIO(data), sep=None, engine="python")
-    df = df.apply(pd.to_numeric, errors="coerce").dropna(how="all", axis=1).dropna()
-    df = df.rename(columns={df.columns[0]: "time"})
-    return df.sort_values("time").reset_index(drop=True)
+        sheets = {"csv": pd.read_csv(io.BytesIO(data), sep=None, engine="python", header=None)}
+    best = None
+    for df in sheets.values():
+        b = _numeric_block(df)
+        if b is not None and (best is None or b.size > best.size):
+            best = b
+    if best is None:
+        raise ValueError("No table with a time column and at least one signal column was found.")
+    return best.sort_values("time").reset_index(drop=True)
 
 
 def load_file(data: bytes, filename: str) -> pd.DataFrame:
@@ -64,31 +107,50 @@ def load_file(data: bytes, filename: str) -> pd.DataFrame:
         return read_pv_massspec_dat(data)
     try:
         return read_pv_massspec_dat(data)
-    except ValueError:
+    except (ValueError, UnicodeDecodeError):
         return read_table(data, filename)
 
 
-def guess_columns(df: pd.DataFrame) -> dict[str, str | None]:
-    """Guess which column is N2, N2O and the inert reference.
+def _profile(t: np.ndarray, y: np.ndarray) -> dict:
+    y = pd.Series(y).rolling(9, center=True, min_periods=1).mean().to_numpy()
+    lo, hi = np.percentile(y, 2), np.percentile(y, 98)
+    span = hi - lo
+    n = len(y)
+    head = np.mean(y[: max(5, n // 10)])
+    tail = np.mean(y[-max(5, n // 10):])
+    return {
+        "rel_range": span / max(abs(np.mean(y)), 1e-300),      # small for the reference
+        "t_peak": t[int(np.argmax(y))],
+        "tail_vs_peak": (tail - head) / span if span > 0 else 0,  # N2O ~0.6-1, N2 ~0.1-0.3
+        "rise": (tail - head) / span if span > 0 else 0,
+        "mean": float(np.mean(y)),
+    }
 
-    N2 has a sharp peak right after the switch; N2O rises late to a plateau; the reference is the
-    largest and most constant signal. Defaults follow the usual export order (1 = N2, 2 = ref, 3 = N2O).
+
+def guess_columns(df: pd.DataFrame) -> dict[str, str | None]:
+    """Guess N2, N2O and inert reference from the shape of each signal.
+
+    reference = flattest signal (smallest relative range, usually also the largest);
+    N2O       = signal that ends highest relative to its own range (rises to a plateau);
+    N2        = signal that peaks early and falls back (sharp peak after the switch).
     """
     cols = [c for c in df.columns if c != "time"]
-    if len(cols) >= 3 and {"curve_1", "curve_2", "curve_3"} <= set(cols):
-        return {"n2": "curve_1", "ref": "curve_2", "n2o": "curve_3"}
-    if len(cols) >= 3:
-        means = df[cols].mean()
-        ref = means.idxmax()
-        rest = [c for c in cols if c != ref]
-        # N2 peaks early: compare time of maximum
-        tmax = {c: df["time"][df[c].idxmax()] for c in rest}
-        n2 = min(tmax, key=tmax.get)
-        n2o = [c for c in rest if c != n2][0]
-        return {"n2": n2, "ref": ref, "n2o": n2o}
-    if len(cols) == 2:
-        return {"n2": cols[0], "ref": None, "n2o": cols[1]}
-    return {"n2": None, "ref": None, "n2o": cols[0] if cols else None}
+    t = df["time"].to_numpy(float)
+    prof = {c: _profile(t, df[c].to_numpy(float)) for c in cols}
+    out = {"n2": None, "ref": None, "n2o": None}
+    # MS ion currents are positive – columns with clearly negative values are calculated columns
+    rest = [c for c in cols if np.nanpercentile(df[c].to_numpy(float), 5) >= 0] or list(cols)
+    if len(rest) >= 3:
+        flat = min(rest, key=lambda c: prof[c]["rel_range"])
+        if prof[flat]["rel_range"] < 1.2:
+            out["ref"] = flat
+            rest.remove(flat)
+    if rest:
+        out["n2o"] = max(rest, key=lambda c: prof[c]["tail_vs_peak"])
+        rest.remove(out["n2o"])
+    if rest:
+        out["n2"] = min(rest, key=lambda c: prof[c]["tail_vs_peak"])
+    return out
 
 
 # ----------------------------------------------------------------------------- settings
@@ -201,6 +263,8 @@ def auto_windows(p: pd.DataFrame, w: Windows | None = None) -> Windows:
     base0, sd0 = np.mean(sig[:head]), np.std(sig[:head])
     rough = t[np.argmax(sig > base0 + max(10 * sd0, 0.05 * (sig.max() - base0)))]
 
+    if rough - 10 <= t[min(head, len(t) - 1)]:
+        rough = t[min(head, len(t) - 1)] + 10
     baseline = w.baseline or (float(t[0]), float(rough - 10))
     b = _mean(t, sig, *baseline)
     start = w.start
@@ -213,8 +277,7 @@ def auto_windows(p: pd.DataFrame, w: Windows | None = None) -> Windows:
     if plateau is None:
         after = t > start
         smooth = pd.Series(n2o).rolling(15, center=True, min_periods=1).mean().to_numpy()
-        tail = after & (t >= t[after][int(0.6 * after.sum())])           # last 40 % after onset
-        level = np.median(n2o[tail])
+        level = np.percentile(smooth[after], 95)                          # plateau level (robust to drift)
         b44 = _mean(t, n2o, *baseline)
         reach = np.where(after & (smooth - b44 >= w.plateau_fraction * (level - b44)))[0]
         p0 = float(t[reach[0]]) if len(reach) else float(t[after][len(t[after]) // 2])
@@ -230,7 +293,11 @@ def analyse(p: pd.DataFrame, s: Sample, w: Windows) -> tuple[Result, pd.DataFram
     b44 = _mean(t, n2o, *w.baseline)
     p44 = _mean(t, n2o, *w.plateau)
     if p44 <= b44:
-        raise ValueError("N2O plateau is not above the baseline – check the windows / column choice.")
+        raise ValueError(
+            f"N2O plateau ({p44:.3e}, {w.plateau[0]:.0f}–{w.plateau[1]:.0f} s) is not above the baseline "
+            f"({b44:.3e}, {w.baseline[0]:.0f}–{w.baseline[1]:.0f} s). Check that the N2O column is right "
+            "(it should rise late and stay high) and the time windows."
+        )
     f_n2o = (n2o - b44) / (p44 - b44)
     deficit = 1 - f_n2o
     t_eq = _trapz(t, deficit, w.start, w.plateau[0])
@@ -367,3 +434,4 @@ def excel_report(raw: pd.DataFrame, cols: dict, calc: pd.DataFrame, s: Sample, r
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
+
